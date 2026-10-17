@@ -1,0 +1,5 @@
+config.json
+*.session
+*.session-journal
+monitor.log
+__pycache__/
