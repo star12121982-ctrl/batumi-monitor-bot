@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +53,15 @@ log = logging.getLogger("batumi-monitor")
 
 # --- Режим работы ---
 CLOUD = os.environ.get("MONITOR_MODE", "").strip().lower() == "cloud"
+
+# Сколько минут длится одна «смена» в облаке. GitHub даёт на запуск максимум
+# 6 часов; берём меньше, чтобы смена сама аккуратно завершалась, а следующая
+# (уже стоящая в очереди) сразу её подхватывала. Пауза между сменами ~1 минута,
+# и пропущенное добирается из истории (catch_up).
+try:
+    CLOUD_SHIFT_MINUTES = int(os.environ.get("TG_SHIFT", "") or 330)
+except ValueError:
+    CLOUD_SHIFT_MINUTES = 330
 
 
 def _env(name: str, default=None):
@@ -667,11 +677,39 @@ async def main() -> None:
     )
     log.info("Пульс каждые %d мин.", HEARTBEAT_MINUTES)
 
+    # В облаке ограничиваем «смену» по времени: по её окончании аккуратно
+    # отключаемся, чтобы следующий запуск (уже стоящий в очереди GitHub)
+    # сразу продолжил работу.
+    stop_requested = False
+
+    async def shift_timer():
+        nonlocal stop_requested
+        remain = CLOUD_SHIFT_MINUTES * 60
+        while remain > 0:
+            step = min(60, remain)
+            await asyncio.sleep(step)
+            remain -= step
+        stop_requested = True
+        log.info("Смена отработана (%d мин) — завершаю работу.", CLOUD_SHIFT_MINUTES)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    if CLOUD:
+        log.info(
+            "Смена рассчитана на %d мин, затем её сменит следующий запуск.",
+            CLOUD_SHIFT_MINUTES,
+        )
+        asyncio.create_task(shift_timer())
+
     # Держим соединение живым: при обрыве сети — переподключаемся,
     # вместо того чтобы скрипт просто завершался.
     while True:
         try:
             await client.run_until_disconnected()
+            if stop_requested:
+                break
             log.warning(
                 "Соединение разорвано (сеть/сервер Telegram). "
                 "Переподключение через 15 секунд..."
@@ -681,6 +719,9 @@ async def main() -> None:
         except Exception as e:
             log.error("Сбой в работе: %s: %s", type(e).__name__, e)
             log.warning("Переподключение через 15 секунд...")
+
+        if stop_requested:
+            break
 
         await asyncio.sleep(15)
         for attempt in range(1, 31):
@@ -702,9 +743,33 @@ async def main() -> None:
         else:
             log.error("Не удалось переподключиться за 30 попыток — жду 60 сек и дальше.")
 
+    # Смена завершается аккуратно: сохраняем прогресс и отключаемся,
+    # чтобы следующему запуску сессия досталась «свободной».
+    try:
+        save_state(push=True, force=True)
+    except Exception:
+        pass
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nОстановлено пользователем.")
+    except Exception as e:
+        # Аварийное завершение. Сообщаем об этом в Telegram через БОТА — он
+        # работает независимо от сессии Telegram, поэтому поломка не будет
+        # незаметной (именно так мы узнали про заблокированную сессию).
+        log.error("Критическая ошибка: %s: %s\n%s", type(e).__name__, e, traceback.format_exc())
+        try:
+            bot_send_sync(
+                "⚠️ Мониторинг остановился с ошибкой:\n"
+                f"{type(e).__name__}: {e}"
+            )
+        except Exception:
+            pass
+        raise
