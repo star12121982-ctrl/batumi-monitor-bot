@@ -1,9 +1,14 @@
 name: batumi-monitor
 
-# Работа «сменами»: GitHub каждые 5 минут запускает новую смену,
-# а предыдущую автоматически останавливает (cancel-in-progress).
+# Работа длинными «сменами». GitHub запускает workflow по расписанию, но при
+# занятом runner-е новый запуск не отменяет текущий, а ВСТАЁТ В ОЧЕРЕДЬ
+# (cancel-in-progress: false). Когда текущая смена завершается, из очереди
+# сразу стартует следующая — так мониторинг идёт почти непрерывно, 24/7.
 # Пропущенные за паузу сообщения скрипт добирает из истории Telegram,
 # поэтому уведомления не теряются.
+#
+# ВАЖНО: сессия Telegram должна использоваться только в одном месте. Нельзя
+# одновременно запускать локальный run.bat — Telegram заблокирует сессию.
 
 on:
   schedule:
@@ -12,7 +17,9 @@ on:
 
 concurrency:
   group: batumi-monitor
-  cancel-in-progress: true
+  # false = не отменять работающую смену, а ставить новый запуск в очередь.
+  # Это защищает сессию Telegram от одновременного использования с двух IP.
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -20,7 +27,9 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # 6 часов — жёсткий максимум GitHub. Ставим чуть меньше;
+    # сама смена завершается раньше (TG_SHIFT минут) и уступает очередь.
+    timeout-minutes: 350
     steps:
       - name: Получить код
         uses: actions/checkout@v4
@@ -53,4 +62,6 @@ jobs:
           TG_ALONE: ${{ secrets.TG_ALONE }}
           TG_FALLBACK: ${{ secrets.TG_FALLBACK }}
           TG_HEARTBEAT: ${{ secrets.TG_HEARTBEAT }}
+          TG_SHIFT: ${{ secrets.TG_SHIFT }}
+          TG_OUTGOING: ${{ secrets.TG_OUTGOING }}
         run: python monitor.py
